@@ -1175,6 +1175,7 @@
                     auth: {
                         autoRefreshToken: true,
                         persistSession: true,
+                        detectSessionInUrl: false, // Prevent concurrent/duplicate auto-exchanges of PKCE code on creation
                         storage: window.localStorage,
                         storageKey: 'empManager_sb_auth',
                     }
@@ -1192,12 +1193,17 @@
         // ============================================================
         async function getSession() {
             if (!STATE.supabase) return null;
-            const { data, error } = await STATE.supabase.auth.getSession();
-            if (error) {
-                console.error('getSession error:', error);
+            try {
+                const { data, error } = await STATE.supabase.auth.getSession();
+                if (error) {
+                    console.error('getSession error:', error);
+                    return null;
+                }
+                return data.session;
+            } catch (err) {
+                console.error('getSession unexpected error:', err);
                 return null;
             }
-            return data.session;
         }
 
         async function signInWithGoogle() {
@@ -1206,10 +1212,14 @@
                 return;
             }
             loginStatus.textContent = 'Redirecting to Google...';
+            let redirectUrl = window.location.origin + window.location.pathname;
+            if (redirectUrl.endsWith('index.html')) {
+                redirectUrl = redirectUrl.slice(0, -10); // remove 'index.html' suffix to match whitelist
+            }
             const { error } = await STATE.supabase.auth.signInWithOAuth({
                 provider: 'google',
                 options: {
-                    redirectTo: window.location.origin + window.location.pathname,
+                    redirectTo: redirectUrl,
                 },
             });
             if (error) {
@@ -1410,7 +1420,7 @@
             if (el) el.classList.add('active');
         }
 
-        function renderApp() {
+        async function renderApp() {
             const cfg = loadConfig();
             if (!cfg) {
                 topbar.style.display = 'none';
@@ -1422,21 +1432,23 @@
                 initSupabase();
             }
             // check session
-            getSession().then(session => {
+            try {
+                const session = await getSession();
                 STATE.session = session;
                 if (session) {
                     topbar.style.display = 'flex';
                     userEmail.textContent = session.user?.email || 'User';
-                    renderDashboard();
+                    await renderDashboard();
                 } else {
                     topbar.style.display = 'none';
                     showPage('pageLogin');
                     loginStatus.textContent = '';
                 }
-            }).catch(() => {
+            } catch (err) {
+                console.error('Session retrieval failed:', err);
                 topbar.style.display = 'none';
                 showPage('pageLogin');
-            });
+            }
         }
 
         // ---- RENDER DASHBOARD ----
@@ -2012,19 +2024,42 @@
             if (!cfg) return;
             if (!STATE.supabase) initSupabase();
             if (!STATE.supabase) return;
-            const { data, error } = await STATE.supabase.auth.getSession();
-            if (error) {
-                console.error('Auth callback error:', error);
-                return;
-            }
-            if (data.session) {
-                STATE.session = data.session;
-                // Check if URL has hash params from OAuth
-                if (window.location.hash) {
-                    // clean URL
-                    window.history.replaceState(null, '', window.location.pathname + window.location.search);
+
+            const hasHash = window.location.hash && window.location.hash.includes('access_token');
+            const hasQuery = window.location.search && (window.location.search.includes('code=') || window.location.search.includes('error='));
+
+            if (hasHash || hasQuery) {
+                // If there's an OAuth error parameter in the URL redirect, log it, clean URL, and abort
+                if (window.location.search && window.location.search.includes('error=')) {
+                    console.error('OAuth redirect returned error:', window.location.search);
+                    let newUrl = window.location.pathname;
+                    window.history.replaceState(null, '', newUrl);
+                    return;
                 }
-                renderApp();
+
+                const { data, error } = await STATE.supabase.auth.getSession();
+                if (error) {
+                    console.error('Auth callback error:', error);
+                    return;
+                }
+                if (data.session) {
+                    STATE.session = data.session;
+                    // clean URL from OAuth hash/query parameters
+                    let newUrl = window.location.pathname;
+                    if (window.location.search) {
+                        const params = new URLSearchParams(window.location.search);
+                        params.delete('code');
+                        params.delete('state');
+                        params.delete('error');
+                        params.delete('error_description');
+                        params.delete('error_code');
+                        const queryStr = params.toString();
+                        if (queryStr) {
+                            newUrl += '?' + queryStr;
+                        }
+                    }
+                    window.history.replaceState(null, '', newUrl);
+                }
             }
         }
 
@@ -2042,24 +2077,8 @@
                 topbar.style.display = 'none';
             }
 
-            // If already has config but no session, show login
-            if (cfg && !STATE.session) {
-                topbar.style.display = 'none';
-                showPage('pageLogin');
-            } else if (cfg && STATE.session) {
-                topbar.style.display = 'flex';
-                userEmail.textContent = STATE.session.user?.email || 'User';
-                renderDashboard();
-            }
-
-            // Handle OAuth redirect hash cleanup (after page load)
-            if (window.location.hash && window.location.hash.includes('access_token')) {
-                // Supabase already handled it via getSession
-                // Just clean the URL
-                setTimeout(() => {
-                    window.history.replaceState(null, '', window.location.pathname + window.location.search);
-                }, 500);
-            }
+            // Delegate routing and dashboard rendering entirely to renderApp
+            await renderApp();
         }
 
         // Run
